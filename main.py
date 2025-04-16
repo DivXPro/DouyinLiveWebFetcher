@@ -7,9 +7,10 @@
 # @Project:     douyinLiveWebFetcher
 
 from liveMan import DouyinLiveWebFetcher
+from config import API_URL
 
 if __name__ == '__main__':
-    live_id = '584482364609'
-    room = DouyinLiveWebFetcher(live_id)
+    live_id = '5168902178'
+    room = DouyinLiveWebFetcher(live_id, API_URL)
     room.get_room_status()
     room.start()

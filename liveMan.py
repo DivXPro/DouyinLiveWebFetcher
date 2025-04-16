@@ -24,6 +24,7 @@ import websocket
 from py_mini_racer import MiniRacer
 
 from protobuf.douyin import *
+from config import DOUYIN_COOKIE
 
 
 @contextmanager
@@ -89,7 +90,7 @@ def generateMsToken(length=107):
 
 class DouyinLiveWebFetcher:
     
-    def __init__(self, live_id):
+    def __init__(self, live_id, api_url):
         """
         直播间弹幕抓取对象
         :param live_id: 直播间的直播id，打开直播间web首页的链接如：https://live.douyin.com/261378947940，
@@ -97,11 +98,14 @@ class DouyinLiveWebFetcher:
         """
         self.__ttwid = None
         self.__room_id = None
+        self.api_url = api_url
         self.live_id = live_id
         self.live_url = "https://live.douyin.com/"
         self.user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) " \
                           "Chrome/120.0.0.0 Safari/537.36"
-    
+        self.users_data = {}  # 用于存储进入直播间的用户数据
+        self.room_status = None
+
     def start(self):
         self._connectWebSocket()
     
@@ -139,7 +143,7 @@ class DouyinLiveWebFetcher:
         url = self.live_url + self.live_id
         headers = {
             "User-Agent": self.user_agent,
-            "cookie": f"ttwid={self.ttwid}&msToken={generateMsToken()}; __ac_nonce=0123407cc00a9e438deb4",
+            "cookie": f"ttwid={self.ttwid}&msToken={generateMsToken()}; {DOUYIN_COOKIE}",
         }
         try:
             response = requests.get(url, headers=headers)
@@ -154,7 +158,94 @@ class DouyinLiveWebFetcher:
             self.__room_id = match.group(1)
             
             return self.__room_id
+
+    def _addUser(self, user):
+        if user.id == 111111:
+            return
+        # 使用 get 方法安全地获取数据
+        if self.users_data.get(user.id) is not None:
+            return
+            
+        user_data = {
+            'user_id': user.id,
+            'sec_uid': user.sec_uid,
+            'room_id': self.room_id,
+        }
+        self.users_data[user.id] = user_data
+        self._reportUserData(user_data)
+
+    def _reportRoomData(self, room_data):
+        """上报房间数据到API"""
+        try:
+            response = requests.post(self.api_url+"/room", json=room_data)
+            response.raise_for_status()
+            print(f"【API】成功上报房间数据：[{room_data.get('room_id')}]")
+        except requests.exceptions.RequestException as e:    
+            print(f"【API】上报房间数据失败：[{room_data.room_id}] - {str(e)}")
+
+    def _reportUserData(self, user_data):
+        """上报用户数据到API"""
+        print("report user: ", user_data)
+        try:
+            response = requests.post(self.api_url+"/room_user", json=user_data)
+            response.raise_for_status()
+            print(f"【API】成功上报用户数据：[{user_data.get('user_id')}]")
+        except requests.exceptions.RequestException as e:
+            print(f"【API】上报用户数据失败：[{user_data.get('user_id')}] - {str(e)}")
+
+    def start(self):
+        self._connectWebSocket()
     
+    def stop(self):
+        self.ws.close()
+    
+    @property
+    def ttwid(self):
+        """
+        产生请求头部cookie中的ttwid字段，访问抖音网页版直播间首页可以获取到响应cookie中的ttwid
+        :return: ttwid
+        """
+        if self.__ttwid:
+            return self.__ttwid
+        headers = {
+            "User-Agent": self.user_agent,
+        }
+        try:
+            response = requests.get(self.live_url, headers=headers)
+            response.raise_for_status()
+        except Exception as err:
+            print("【X】Request the live url error: ", err)
+        else:
+            self.__ttwid = response.cookies.get('ttwid')
+            return self.__ttwid
+    
+    @property
+    def room_id(self):
+        """
+        根据直播间的地址获取到真正的直播间roomId，有时会有错误，可以重试请求解决
+        :return:room_id
+        """
+        if self.__room_id:
+            return self.__room_id
+        url = self.live_url + self.live_id
+        headers = {
+            "User-Agent": self.user_agent,
+            "cookie": f"ttwid={self.ttwid}&msToken={generateMsToken()}; {DOUYIN_COOKIE}",
+        }
+        try:
+            response = requests.get(url, headers=headers)
+            response.raise_for_status()
+        except Exception as err:
+            print("【X】Request the live room url error: ", err)
+        else:
+            match = re.search(r'roomId\\":\\"(\d+)\\"', response.text)
+            if match is None or len(match.groups()) < 1:
+                print("【X】No match found for roomId")
+            
+            self.__room_id = match.group(1)
+            
+            return self.__room_id
+
     def get_room_status(self):
         """
         获取直播间开播状态:
@@ -176,11 +267,15 @@ class DouyinLiveWebFetcher:
         data = resp.json().get('data')
         if data:
             room_status = data.get('room_status')
+
             user = data.get('user')
             user_id = user.get('id_str')
+            sec_uid = user.get('sec_uid')
             nickname = user.get('nickname')
-            print(f"【{nickname}】[{user_id}]直播间：{['正在直播', '已结束'][bool(room_status)]}.")
-    
+            room_name = data.get('data')[0].get('title')
+            print(f"【{nickname}】[{user_id}]直播间<{room_name}-{self.room_id}>：{['正在直播', '已结束'][bool(room_status)]}.")
+            self._reportRoomData({ 'room_id': self.room_id, 'aweme_id': self.live_id, 'room_name': room_name, 'author_id': sec_uid })
+
     def _connectWebSocket(self):
         """
         连接抖音直播间websocket服务器，请求直播间数据
@@ -228,7 +323,7 @@ class DouyinLiveWebFetcher:
             try:
                 heartbeat = PushFrame(payload_type='hb').SerializeToString()
                 self.ws.send(heartbeat, websocket.ABNF.OPCODE_PING)
-                print("【√】发送心跳包")
+                # print("【√】发送心跳包")
             except Exception as e:
                 print("【X】心跳包检测错误: ", e)
                 break
@@ -296,7 +391,8 @@ class DouyinLiveWebFetcher:
         user_name = message.user.nick_name
         user_id = message.user.id
         content = message.content
-        print(f"【聊天msg】[{user_id}]{user_name}: {content}")
+        # self._addUser(message.user)
+        # print(f"【聊天msg】[{user_id}]{user_name}: {content}")
     
     def _parseGiftMsg(self, payload):
         """礼物消息"""
@@ -304,14 +400,16 @@ class DouyinLiveWebFetcher:
         user_name = message.user.nick_name
         gift_name = message.gift.name
         gift_cnt = message.combo_count
-        print(f"【礼物msg】{user_name} 送出了 {gift_name}x{gift_cnt}")
+        # self._addUser(message.user)
+        # print(f"【礼物msg】{user_name} 送出了 {gift_name}x{gift_cnt}")
     
     def _parseLikeMsg(self, payload):
         '''点赞消息'''
         message = LikeMessage().parse(payload)
         user_name = message.user.nick_name
         count = message.count
-        print(f"【点赞msg】{user_name} 点了{count}个赞")
+        # self._addUser(message.user)
+        # print(f"【点赞msg】{user_name} 点了{count}个赞")
     
     def _parseMemberMsg(self, payload):
         '''进入直播间消息'''
@@ -319,6 +417,7 @@ class DouyinLiveWebFetcher:
         user_name = message.user.nick_name
         user_id = message.user.id
         gender = ["女", "男"][message.user.gender]
+        self._addUser(message.user)
         print(f"【进场msg】[{user_id}][{gender}]{user_name} 进入了直播间")
     
     def _parseSocialMsg(self, payload):
@@ -326,20 +425,21 @@ class DouyinLiveWebFetcher:
         message = SocialMessage().parse(payload)
         user_name = message.user.nick_name
         user_id = message.user.id
-        print(f"【关注msg】[{user_id}]{user_name} 关注了主播")
+        # self._addUser(message.user)
+        # print(f"【关注msg】[{user_id}]{user_name} 关注了主播")
     
     def _parseRoomUserSeqMsg(self, payload):
         '''直播间统计'''
         message = RoomUserSeqMessage().parse(payload)
         current = message.total
         total = message.total_pv_for_anchor
-        print(f"【统计msg】当前观看人数: {current}, 累计观看人数: {total}")
+        # print(f"【统计msg】当前观看人数: {current}, 累计观看人数: {total}")
     
     def _parseFansclubMsg(self, payload):
         '''粉丝团消息'''
         message = FansclubMessage().parse(payload)
         content = message.content
-        print(f"【粉丝团msg】 {content}")
+        # print(f"【粉丝团msg】 {content}")
     
     def _parseEmojiChatMsg(self, payload):
         '''聊天表情包消息'''
@@ -348,7 +448,8 @@ class DouyinLiveWebFetcher:
         user = message.user
         common = message.common
         default_content = message.default_content
-        print(f"【聊天表情包id】 {emoji_id},user：{user},common:{common},default_content:{default_content}")
+        # self._addUser(message.user)
+        # print(f"【聊天表情包id】 {emoji_id},user：{user},common:{common},default_content:{default_content}")
     
     def _parseRoomMsg(self, payload):
         message = RoomMessage().parse(payload)
@@ -364,7 +465,7 @@ class DouyinLiveWebFetcher:
     def _parseRankMsg(self, payload):
         message = RoomRankMessage().parse(payload)
         ranks_list = message.ranks_list
-        print(f"【直播间排行榜msg】{ranks_list}")
+        # print(f"【直播间排行榜msg】{ranks_list}")
     
     def _parseControlMsg(self, payload):
         '''直播间状态消息'''
@@ -377,4 +478,18 @@ class DouyinLiveWebFetcher:
     def _parseRoomStreamAdaptationMsg(self, payload):
         message = RoomStreamAdaptationMessage().parse(payload)
         adaptationType = message.adaptation_type
-        print(f'直播间adaptation: {adaptationType}')
+        # print(f'直播间adaptation: {adaptationType}')
+    
+    def get_users_data(self):
+        """
+        获取所有进入直播间的用户数据
+        :return: 用户数据字典，key为用户ID，value为用户信息
+        """
+        return self.users_data
+    
+    def get_user_count(self):
+        """
+        获取进入直播间的用户数量
+        :return: 用户数量
+        """
+        return len(self.users_data)
